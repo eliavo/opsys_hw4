@@ -50,7 +50,7 @@ void initQueue(void) {
     return;
 }
 
-void destroyQueueu(void) {
+void destroyQueue(void) {
     struct value_queue_node *node;
     struct waiting_queue_node *w_node;
 
