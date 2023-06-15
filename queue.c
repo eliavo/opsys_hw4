@@ -11,11 +11,10 @@ struct value_queue {
   struct value_queue_node *head;
   struct value_queue_node *tail;
 };
-size_t value_size;
+atomic_size_t value_size;
 
 struct waiting_queue_node {
   cnd_t *cond;
-  bool woken_up; //value will only be changed once from false to true so no concurrency issues
   struct waiting_queue_node *next;
 };
 
@@ -25,28 +24,24 @@ struct waiting_queue {
 };
 atomic_size_t waiting;
 
-mtx_t value_enqueue_lock, waiting_enqueue_lock;
-mtx_t value_head_lock, waiting_head_lock;
+mtx_t value_enqueue_lock;
+mtx_t value_head_lock;
 atomic_size_t visited;
 
-struct value_queue *value_queue;
-struct waiting_queue *waiting_queue;
+struct value_queue value_queue; //initialized once and used exclusively so no * needed
+struct waiting_queue waiting_queue;
 
 
 void initQueue(void) {
-    value_queue = (struct value_queue)malloc(sizeof(struct value_queue));
-    value_queue->head = NULL;
-    value_queue->tail = NULL;
+    value_queue.head = NULL;
+    value_queue.tail = NULL;
 
-    waiting_queue = (struct waiting_queue)malloc(sizeof(struct waiting_queue));
-    waiting_queue->head = NULL;
-    waiting_queue->tail = NULL;
+    waiting_queue.head = NULL;
+    waiting_queue.tail = NULL;
 
     mtx_init(&value_enqueue_lock, mtx_plain);
-    mtx_init(&waiting_enqueue_lock, mtx_plain);
 
     mtx_init(&value_head_lock, mtx_plain);
-    mtx_init(&waiting_head_lock, mtx_plain);
 
     value_size = 0;
     waiting = 0;
@@ -60,22 +55,18 @@ void destroyQueueu(void) {
     struct waiting_queue_node *w_node;
 
     mtx_destroy(&value_enqueue_lock);
-    mtx_destroy(&waiting_enqueue_lock);
 
     mtx_destroy(&value_head_lock);
-    mtx_destroy(&waiting_head_lock);
 
-    for (node = value_queue->head; node != NULL; node = node->next) {
+    for (node = value_queue.head; node != NULL; node = node->next) {
         free(node);
     }
-    for (w_node = waiting_queue->head; w_node != NULL; w_node = w_node->next) {
+    for (w_node = waiting_queue.head; w_node != NULL; w_node = w_node->next) {
         // this loop shouldn't happen.
         // we free the nodes JIC.
+        cnd_destroy(w_node->cond);
         free(w_node);
     }
-
-    free(value_queue);
-    free(waiting_queue);
 
     return;
 }
@@ -84,20 +75,20 @@ void add_to_value_queue(struct value_queue_node *node) {
 
     lock(&value_enqueue_lock);
 
-        if (value_queue->tail != NULL) { // common case
+        if (value_queue.tail != NULL) { // common case
 
-            value_queue->tail->next = node;
-            value_queue->tail = node;
+            value_queue.tail->next = node;
+            value_queue.tail = node;
 
         } else { // value queue is empty. need to take care of a few conditions.
             lock(&value_head_lock); // make sure we have control of the first argument
 
                 // insert the node
-                value_queue->head = node;
-                value_queue->tail = node;
+                value_queue.head = node;
+                value_queue.tail = node;
 
-                if (waiting > 0) { // if there are waiting threads, alert the head
-                    remove_from_waiting_queue(waiting_queue);
+                if (waiting_queue.head == NULL) { // if there are waiting threads, alert the head
+                    remove_from_waiting_queue();
                 }
                 // tricky race might occur when at the same time, a thread is inserted to the waiting queue.
                 // this condition cannot happen in our current implementation.
@@ -106,8 +97,8 @@ void add_to_value_queue(struct value_queue_node *node) {
             unlock(&value_head_lock);
 
         }
-    value_size++;
     unlock(&value_enqueue_lock);
+    value_size++;
 
     return;
 }
@@ -118,83 +109,108 @@ void* remove_from_value_queue(void) {
     cnd_t *cond;
 
 
+    value_size--;
     lock(&value_head_lock);
-        value_size--;
 
-        node = value_queue->head;
+        node = value_queue.head;
         if (node == NULL) {
-
             cnd_init(cond);
-            add_to_waiting_queue(waiting_queue, cond);
+            add_to_waiting_queue(cond);
             cnd_wait(cond, &value_head_lock);
-            node = value_queue->head;
+            node = value_queue.head;
+        }
+        // if there is a tryDequeue after cnd_signal is called on the thread, but before it executes,
+        // we need to make sure we have the node
+        while (node == NULL) {
+            add_to_waiting_queue_head(cond);
+            cnd_wait(cond, &value_head_lock);
         }
 
-        visited++;
+
         value = node->value;
-        value_queue->head = value_queue->head->next;
+        value_queue.head = value_queue.head->next;
+        if (value_queue.head == NULL)
+            value_queue.tail = NULL;
 
         // waiting doesn't have to be locked because add_to/remove_from_waiting_queue are locked by value_head_lock in all cases.
-        if (value_size > 0 && waiting > 0) {
-            remove_from_waiting_queue(waiting_queue);
+        if (value_queue.head != NULL && waiting_queue.head != NULL) {
+            remove_from_waiting_queue();
         }
     
     unlock(&value_head_lock);
 
+    visited++;
+
+    cnd_destroy(cond);
     free(node);
     return value;
 }
 
-void add_to_waiting_queue(struct waiting_queue *queue, cnd_t *cond) {
+bool try_remove_from_value_queue(void** value_p) {
+    void* value
+    lock(&value_head_lock);
+
+        if (value_queue.head != NULL) {
+            *value_p = value_queue.head->value;
+            return true;
+        }
+        return false;
+
+    unlock(&value_head_lock);
+}
+
+// this function is protected by value_head_lock exclusively, so it doesn't need locks
+void add_to_waiting_queue(cnd_t *cond) {
     struct waiting_queue_node *node;
 
-
-    node = (struct waiting_queue_node)malloc(sizeof(struct waiting_queue_node));
+    node = (struct waiting_queue_node*)malloc(sizeof(struct waiting_queue_node));
     node->cond = cond;
     node->next = NULL;
-    node->woken_up = false;
 
-    lock(&waiting_enqueue_lock);
+    if (waiting_queue.tail == NULL) {
+        waiting_queue.head = node;
+        waiting_queue.tail = node;
 
-        if (queue->tail == NULL) {
-            lock(&waiting_head_lock);
-
-                queue->head = node;
-                queue->tail = node;
-            
-            unlock(&waiting_head_lock);
-
-        } else {
-            queue->tail->next = node;
-            queue->tail = node;
-        }
-    
-    unlock(&waiting_enqueue_lock);
+    } else {
+        waiting_queue.tail->next = node;
+        waiting_queue.tail = node;
+    }
 
     waiting++;
 
     return;
 }
 
-void remove_from_waiting_queue(struct waiting_queue *queue) {
+void add_to_waiting_queue_head(cnd_t *cond) {
     struct waiting_queue_node *node;
 
-    lock(&waiting_head_lock);
+    node = (struct waiting_queue_node*)malloc(sizeof(struct waiting_queue_node));
+    node->cond = cond;
+    node->next = waiting_queue.head;
 
-        node = queue->head;
-        if (node == NULL)
-            return;
+    waiting_queue.head = node;
+    if (waiting_queue.tail == NULL)
+        waiting_queue.tail = node;
 
-        queue->head = queue->head->next;
+    waiting++;
+}
 
-        cnd_signal(node->cond);
-    
-    unlock(&waiting_head_lock);
+// this function is protected by value_head_lock exclusively, so it doesn't need locks
+void remove_from_waiting_queue() {
+    struct waiting_queue_node *node;
+
+    node = waiting_queue.head;
+    if (node == NULL)
+        return;
+
+    waiting_queue.head = waiting_queue.head->next;
+
+    cnd_signal(node->cond);
 
     waiting--;
     free(node);
 
-    return NULL;
+    return;
 }
 
 size_t size(void) {
@@ -212,7 +228,7 @@ size_t visited(void) {
 void enqueue(const void *value) {
     struct value_queue_node *node;
 
-    node = (struct value_queue_node)malloc(sizeof(struct value_queue_node));
+    node = (struct value_queue_node*)malloc(sizeof(struct value_queue_node));
     node->value = value;
     node->next = NULL;
 
@@ -221,4 +237,8 @@ void enqueue(const void *value) {
 
 void* dequeue(void) {
     return remove_from_value_queue();
+}
+
+bool tryDequeue(void** value_p) {
+    return try_remove_from_value_queue(value_p);
 }
