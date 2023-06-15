@@ -52,7 +52,7 @@ void initQueue(void) {
 
 void destroyQueue(void) {
     struct value_queue_node *node;
-    struct waiting_queue_node *w_node;
+    struct waiting_queue_node *w_node, *w_next;
 
     mtx_destroy(&value_enqueue_lock);
 
@@ -61,10 +61,11 @@ void destroyQueue(void) {
     for (node = value_queue.head; node != NULL; node = node->next) {
         free(node);
     }
-    for (w_node = waiting_queue.head; w_node != NULL; w_node = w_node->next) {
+    for (w_node = waiting_queue.head; w_node != NULL; w_node = w_next) {
         // this loop shouldn't happen.
         // we free the nodes JIC.
         cnd_destroy(w_node->cond);
+        w_next = w_node->next;
         free(w_node);
     }
 
@@ -87,7 +88,7 @@ void add_to_value_queue(struct value_queue_node *node) {
                 value_queue.head = node;
                 value_queue.tail = node;
 
-                if (waiting_queue.head == NULL) { // if there are waiting threads, alert the head
+                if (waiting_queue.head != NULL) { // if there are waiting threads, alert the head
                     remove_from_waiting_queue();
                 }
                 // tricky race might occur when at the same time, a thread is inserted to the waiting queue.
@@ -108,7 +109,6 @@ void* remove_from_value_queue(void) {
     void *value;
     cnd_t *cond;
 
-
     value_size--;
     lock(&value_head_lock);
 
@@ -124,6 +124,7 @@ void* remove_from_value_queue(void) {
         while (node == NULL) {
             add_to_waiting_queue_head(cond);
             cnd_wait(cond, &value_head_lock);
+            node = value_queue.head;
         }
 
 
@@ -198,6 +199,7 @@ void add_to_waiting_queue_head(cnd_t *cond) {
 // this function is protected by value_head_lock exclusively, so it doesn't need locks
 void remove_from_waiting_queue() {
     struct waiting_queue_node *node;
+    cnd_t *cond;
 
     node = waiting_queue.head;
     if (node == NULL)
@@ -205,11 +207,11 @@ void remove_from_waiting_queue() {
 
     waiting_queue.head = waiting_queue.head->next;
 
-    cnd_signal(node->cond);
-
+    cond = node->cond;
     waiting--;
     free(node);
 
+    cnd_signal(cond);
     return;
 }
 
